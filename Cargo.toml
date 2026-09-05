@@ -1,0 +1,12 @@
+[package]
+name = "metacpan-api-modern"
+version = "0.1.0"
+edition = "2024"
+description = "Modern interface to the Metacpan API"
+repository = "https://github.com/uperl/metacpan-api-modern"
+license = "MIT"
+
+[dependencies]
+anyhow = "1.0.104"
+
+
