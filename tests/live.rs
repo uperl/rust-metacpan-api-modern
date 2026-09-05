@@ -7,6 +7,8 @@
 //! cargo test --test live -- --ignored --nocapture
 //! ```
 
+use std::time::Duration;
+
 use metacpan_api_modern::{Client, DownloadUrlQuery, PodFormat, Release, SearchResponse};
 use serde_json::json;
 
@@ -131,6 +133,50 @@ async fn search_dsl_typed() {
         resp.sources()
             .all(|r| r.author.as_deref() == Some("PLICEASE"))
     );
+}
+
+#[tokio::test]
+#[ignore = "network"]
+async fn cache_dir_serves_get_from_disk() {
+    let dir = std::env::temp_dir().join(format!(
+        "metacpan-api-modern-live-cache-{}-{:?}",
+        std::process::id(),
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos()
+    ));
+    let _ = std::fs::remove_dir_all(&dir);
+
+    // First client populates the cache from the network.
+    let warm = Client::builder()
+        .user_agent(concat!("metacpan-api-modern-tests/", env!("CARGO_PKG_VERSION")))
+        .cache_dir(&dir)
+        .build()
+        .unwrap();
+    let first = warm.author("PLICEASE").await.unwrap();
+    assert_eq!(first.pauseid.as_deref(), Some("PLICEASE"));
+    assert!(
+        std::fs::read_dir(&dir).unwrap().count() > 0,
+        "an entry was written to the cache directory"
+    );
+
+    // Second client shares the directory but has an unusably short timeout, so
+    // any real request fails; a cached URL must still resolve.
+    let offline = Client::builder()
+        .user_agent(concat!("metacpan-api-modern-tests/", env!("CARGO_PKG_VERSION")))
+        .cache_dir(&dir)
+        .timeout(Duration::from_millis(1))
+        .build()
+        .unwrap();
+    let cached = offline.author("PLICEASE").await.unwrap();
+    assert_eq!(cached.pauseid.as_deref(), Some("PLICEASE"));
+    assert_eq!(cached.name, first.name);
+
+    // An uncached URL on the offline client still has to go to the network.
+    assert!(offline.author("ETHER").await.is_err());
+
+    let _ = std::fs::remove_dir_all(&dir);
 }
 
 #[tokio::test]

@@ -2,7 +2,8 @@
 
 use serde::Serialize;
 use serde::de::DeserializeOwned;
-use std::time::Duration;
+use std::path::PathBuf;
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use url::Url;
 
 use crate::error::{ApiError, Error, Result};
@@ -20,6 +21,12 @@ pub const DEFAULT_BASE_URL: &str = "https://fastapi.metacpan.org/v1/";
 /// Default `User-Agent` sent with every request.
 pub const DEFAULT_USER_AGENT: &str =
     concat!(env!("CARGO_PKG_NAME"), "/", env!("CARGO_PKG_VERSION"));
+
+/// Default time-to-live for cached `GET` responses: one hour.
+///
+/// Used when [`ClientBuilder::cache_dir`] is set without an explicit
+/// [`ClientBuilder::cache_ttl`].
+pub const DEFAULT_CACHE_TTL: Duration = Duration::from_secs(60 * 60);
 
 /// An asynchronous client for the MetaCPAN HTTP API.
 ///
@@ -39,6 +46,7 @@ pub const DEFAULT_USER_AGENT: &str =
 pub struct Client {
     http: reqwest::Client,
     base_url: Url,
+    cache: Option<HttpCache>,
 }
 
 impl Default for Client {
@@ -210,16 +218,19 @@ impl Client {
         module: &str,
         query: &DownloadUrlQuery,
     ) -> Result<DownloadUrl> {
-        let url = self.url(&format!("download_url/{module}"))?;
-        let mut request = self.http.get(url);
-        if let Some(version) = &query.version {
-            request = request.query(&[("version", version)]);
+        let path = format!("download_url/{module}");
+        let mut url = self.url(&path)?;
+        if query.version.is_some() || query.dev {
+            let mut pairs = url.query_pairs_mut();
+            if let Some(version) = &query.version {
+                pairs.append_pair("version", version);
+            }
+            if query.dev {
+                pairs.append_pair("dev", "1");
+            }
         }
-        if query.dev {
-            request = request.query(&[("dev", "1")]);
-        }
-        let response = request.send().await?;
-        decode(&format!("download_url/{module}"), response).await
+        let raw = self.get_raw(url).await?;
+        decode_bytes(&path, raw.status, &raw.bytes)
     }
 
     // -- mirrors ---------------------------------------------------------
@@ -281,16 +292,20 @@ impl Client {
     where
         T: DeserializeOwned,
     {
-        let url = self.url(&format!("{type_}/_search"))?;
-        let mut params: Vec<(&str, String)> = vec![("q", q.to_owned())];
-        if let Some(size) = size {
-            params.push(("size", size.to_string()));
+        let path = format!("{type_}/_search");
+        let mut url = self.url(&path)?;
+        {
+            let mut pairs = url.query_pairs_mut();
+            pairs.append_pair("q", q);
+            if let Some(size) = size {
+                pairs.append_pair("size", &size.to_string());
+            }
+            if let Some(from) = from {
+                pairs.append_pair("from", &from.to_string());
+            }
         }
-        if let Some(from) = from {
-            params.push(("from", from.to_string()));
-        }
-        let response = self.http.get(url).query(&params).send().await?;
-        decode(&format!("{type_}/_search"), response).await
+        let raw = self.get_raw(url).await?;
+        decode_bytes(&path, raw.status, &raw.bytes)
     }
 
     // -- low-level helpers ---------------------------------------------
@@ -301,14 +316,17 @@ impl Client {
     }
 
     /// Perform a `GET` for `path` and deserialize a JSON body into `T`.
+    ///
+    /// When the client is configured with [`ClientBuilder::cache_dir`] the
+    /// response is served from, and stored in, the on-disk cache.
     pub async fn get_json<T: DeserializeOwned>(&self, path: &str) -> Result<T> {
         let url = self.url(path)?;
-        let response = self.http.get(url).send().await?;
-        decode(path, response).await
+        let raw = self.get_raw(url).await?;
+        decode_bytes(path, raw.status, &raw.bytes)
     }
 
     /// Perform a `POST` of `body` as JSON to `path` and deserialize the JSON
-    /// response into `T`.
+    /// response into `T`. `POST` requests are never cached.
     pub async fn post_json<B, T>(&self, path: &str, body: &B) -> Result<T>
     where
         B: Serialize + ?Sized,
@@ -320,17 +338,52 @@ impl Client {
     }
 
     /// Perform a `GET` for `path` with `query` params and return the response
-    /// body verbatim as text.
+    /// body verbatim as text. Honours the on-disk cache like
+    /// [`get_json`](Self::get_json).
     pub async fn get_text(&self, path: &str, query: &[(&str, &str)]) -> Result<String> {
-        let url = self.url(path)?;
-        let response = self.http.get(url).query(query).send().await?;
-        let status = response.status();
-        let text = response.text().await?;
-        if !status.is_success() {
-            return Err(api_error_from(status.as_u16(), &text));
+        let mut url = self.url(path)?;
+        if !query.is_empty() {
+            url.query_pairs_mut().extend_pairs(query.iter());
         }
-        Ok(text)
+        let raw = self.get_raw(url).await?;
+        if !(200..300).contains(&raw.status) {
+            return Err(api_error_from(
+                raw.status,
+                &String::from_utf8_lossy(&raw.bytes),
+            ));
+        }
+        Ok(String::from_utf8_lossy(&raw.bytes).into_owned())
     }
+
+    /// Perform a `GET` for `url`, returning the raw status and body bytes.
+    ///
+    /// If an on-disk cache is configured and holds a fresh entry for this exact
+    /// URL, that entry is returned without a network request. Otherwise the
+    /// request is made and a successful (`2xx`) response is written to the
+    /// cache before being returned.
+    async fn get_raw(&self, url: Url) -> Result<RawResponse> {
+        if let Some(cache) = &self.cache
+            && let Some(hit) = cache.get(&url)
+        {
+            return Ok(hit);
+        }
+        let response = self.http.get(url.clone()).send().await?;
+        let status = response.status().as_u16();
+        let bytes = response.bytes().await?.to_vec();
+        if let Some(cache) = &self.cache
+            && (200..300).contains(&status)
+        {
+            cache.put(&url, status, &bytes);
+        }
+        Ok(RawResponse { status, bytes })
+    }
+}
+
+/// A `GET` response reduced to the parts this crate needs, so it can come
+/// equally from the network or from the on-disk cache.
+struct RawResponse {
+    status: u16,
+    bytes: Vec<u8>,
 }
 
 /// Turn a non-success HTTP response into an [`Error`], preferring MetaCPAN's
@@ -350,15 +403,18 @@ fn api_error_from(status: u16, body: &str) -> Error {
 }
 
 async fn decode<T: DeserializeOwned>(path: &str, response: reqwest::Response) -> Result<T> {
-    let status = response.status();
+    let status = response.status().as_u16();
     let bytes = response.bytes().await?;
-    if !status.is_success() {
-        return Err(api_error_from(
-            status.as_u16(),
-            &String::from_utf8_lossy(&bytes),
-        ));
+    decode_bytes(path, status, &bytes)
+}
+
+/// Shared by the cached and uncached paths: turn a status code and body bytes
+/// into either a deserialized `T` or an [`Error`].
+fn decode_bytes<T: DeserializeOwned>(path: &str, status: u16, bytes: &[u8]) -> Result<T> {
+    if !(200..300).contains(&status) {
+        return Err(api_error_from(status, &String::from_utf8_lossy(bytes)));
     }
-    serde_json::from_slice(&bytes).map_err(|source| Error::Decode {
+    serde_json::from_slice(bytes).map_err(|source| Error::Decode {
         path: path.to_owned(),
         source,
     })
@@ -426,6 +482,8 @@ pub struct ClientBuilder {
     user_agent: Option<String>,
     timeout: Option<Duration>,
     http: Option<reqwest::Client>,
+    cache_dir: Option<PathBuf>,
+    cache_ttl: Option<Duration>,
 }
 
 impl ClientBuilder {
@@ -459,6 +517,35 @@ impl ClientBuilder {
         self
     }
 
+    /// Cache successful `GET` responses on disk under `dir`, reusing them until
+    /// they are older than [`cache_ttl`](Self::cache_ttl) (one hour by default)
+    /// before refetching.
+    ///
+    /// Every `GET` the client makes — the typed endpoint methods,
+    /// [`Client::get_json`], [`Client::get_text`],
+    /// [`download_url`](Client::download_url), and
+    /// [`search_lucene`](Client::search_lucene) — is keyed by its full request
+    /// URL, including the query string. `POST` requests (the Elasticsearch
+    /// [`Client::search`]) are never cached, and only `2xx` responses are
+    /// stored; errors are always refetched.
+    ///
+    /// The directory is created on first write. Entries are ordinary files
+    /// named by a hash of the URL; deleting one, or the whole directory, simply
+    /// forces a refetch. Cache reads and writes are best-effort — an I/O error
+    /// falls back to a normal request rather than failing the call.
+    pub fn cache_dir(mut self, dir: impl Into<PathBuf>) -> Self {
+        self.cache_dir = Some(dir.into());
+        self
+    }
+
+    /// Override how long a cached `GET` response stays fresh. Has no effect
+    /// unless [`cache_dir`](Self::cache_dir) is also set. Defaults to
+    /// [`DEFAULT_CACHE_TTL`] (one hour).
+    pub fn cache_ttl(mut self, ttl: Duration) -> Self {
+        self.cache_ttl = Some(ttl);
+        self
+    }
+
     /// Build the [`Client`].
     ///
     /// # Errors
@@ -487,8 +574,104 @@ impl ClientBuilder {
             }
         };
 
-        Ok(Client { http, base_url })
+        let cache = self.cache_dir.map(|dir| HttpCache {
+            dir,
+            ttl: self.cache_ttl.unwrap_or(DEFAULT_CACHE_TTL),
+        });
+
+        Ok(Client {
+            http,
+            base_url,
+            cache,
+        })
     }
+}
+
+/// A filesystem cache of `GET` responses, configured by
+/// [`ClientBuilder::cache_dir`].
+///
+/// Each entry is one file, named `<hash-of-url>.cache`, laid out as a short
+/// UTF-8 header (`expires-at` unix seconds, then status, then the URL), a blank
+/// line, and the raw response body. The URL is stored so a hash collision reads
+/// as a miss rather than serving the wrong body.
+#[derive(Debug, Clone)]
+struct HttpCache {
+    dir: PathBuf,
+    ttl: Duration,
+}
+
+impl HttpCache {
+    /// Stable-per-URL basename (without extension) for a cache entry.
+    fn key(&self, url: &Url) -> String {
+        use std::hash::{Hash, Hasher};
+        let mut hasher = std::collections::hash_map::DefaultHasher::new();
+        url.as_str().hash(&mut hasher);
+        format!("{:016x}", hasher.finish())
+    }
+
+    fn entry_path(&self, url: &Url) -> PathBuf {
+        self.dir.join(format!("{}.cache", self.key(url)))
+    }
+
+    /// Return a still-fresh cached response for `url`, if one exists. A missing
+    /// file, an unreadable or malformed entry, a URL mismatch (hash collision),
+    /// or an expired entry all read as a miss; expired entries are removed.
+    fn get(&self, url: &Url) -> Option<RawResponse> {
+        let path = self.entry_path(url);
+        let raw = std::fs::read(&path).ok()?;
+        let sep = raw.windows(2).position(|w| w == b"\n\n")?;
+        let header = std::str::from_utf8(&raw[..sep]).ok()?;
+        let mut lines = header.lines();
+        let expires_at: u64 = lines.next()?.parse().ok()?;
+        let status: u16 = lines.next()?.parse().ok()?;
+        let cached_url = lines.next()?;
+        if cached_url != url.as_str() {
+            return None;
+        }
+        if now_secs() >= expires_at {
+            let _ = std::fs::remove_file(&path);
+            return None;
+        }
+        Some(RawResponse {
+            status,
+            bytes: raw[sep + 2..].to_vec(),
+        })
+    }
+
+    /// Best-effort write of a response for `url`. Any I/O error is swallowed:
+    /// the cache is an optimisation, never a source of failures.
+    fn put(&self, url: &Url, status: u16, body: &[u8]) {
+        if std::fs::create_dir_all(&self.dir).is_err() {
+            return;
+        }
+        let expires_at = now_secs().saturating_add(self.ttl.as_secs());
+        let mut contents =
+            format!("{expires_at}\n{status}\n{}\n\n", url.as_str()).into_bytes();
+        contents.extend_from_slice(body);
+
+        // Write to a unique temp file then rename, so a concurrent reader never
+        // observes a half-written entry.
+        let tmp = self.dir.join(format!("{}.{}.tmp", self.key(url), now_nanos()));
+        if std::fs::write(&tmp, contents).is_ok() {
+            let _ = std::fs::rename(&tmp, self.entry_path(url));
+        } else {
+            let _ = std::fs::remove_file(&tmp);
+        }
+    }
+}
+
+fn now_secs() -> u64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0)
+}
+
+fn now_nanos() -> u128 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.as_nanos())
+        .unwrap_or(0)
 }
 
 #[cfg(test)]
@@ -528,5 +711,58 @@ mod tests {
     fn pod_format_mimes() {
         assert_eq!(PodFormat::Plain.mime(), "text/plain");
         assert_eq!(PodFormat::Markdown.mime(), "text/x-markdown");
+    }
+
+    #[test]
+    fn http_cache_hit_miss_and_expiry() {
+        let dir = std::env::temp_dir().join(format!(
+            "metacpan-api-modern-cache-{}-{}",
+            std::process::id(),
+            now_nanos()
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+
+        let cache = HttpCache {
+            dir: dir.clone(),
+            ttl: Duration::from_secs(3600),
+        };
+        let url = Url::parse("https://example.test/v1/author/PLICEASE").unwrap();
+
+        assert!(cache.get(&url).is_none(), "cold cache is a miss");
+
+        cache.put(&url, 200, b"{\"name\":\"Graham\"}");
+        let hit = cache.get(&url).expect("warm cache is a hit");
+        assert_eq!(hit.status, 200);
+        assert_eq!(hit.bytes, b"{\"name\":\"Graham\"}");
+
+        let other = Url::parse("https://example.test/v1/author/OTHER").unwrap();
+        assert!(cache.get(&other).is_none(), "a different url is a miss");
+
+        let stale = HttpCache {
+            dir: dir.clone(),
+            ttl: Duration::from_secs(0),
+        };
+        stale.put(&url, 200, b"body");
+        assert!(cache.get(&url).is_none(), "an expired entry is a miss");
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn builder_wires_up_cache() {
+        let dir = std::env::temp_dir().join("metacpan-api-modern-cache-builder");
+        let client = Client::builder()
+            .cache_dir(&dir)
+            .cache_ttl(Duration::from_secs(120))
+            .build()
+            .unwrap();
+        let cache = client.cache.as_ref().expect("cache configured");
+        assert_eq!(cache.dir, dir);
+        assert_eq!(cache.ttl, Duration::from_secs(120));
+    }
+
+    #[test]
+    fn no_cache_by_default() {
+        assert!(Client::new().cache.is_none());
     }
 }
