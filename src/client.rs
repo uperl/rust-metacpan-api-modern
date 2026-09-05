@@ -2,7 +2,7 @@
 
 use serde::Serialize;
 use serde::de::DeserializeOwned;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use url::Url;
 
@@ -81,6 +81,31 @@ impl Client {
     /// The underlying [`reqwest::Client`], for advanced or ad-hoc requests.
     pub fn http(&self) -> &reqwest::Client {
         &self.http
+    }
+
+    /// The directory this client caches `GET` responses in, or `None` when
+    /// [`ClientBuilder::cache_dir`] was not set.
+    pub fn cache_dir(&self) -> Option<&Path> {
+        self.cache.as_ref().map(|cache| cache.dir.as_path())
+    }
+
+    /// Delete every entry from the on-disk cache.
+    ///
+    /// Removes the cache files this client writes (`*.cache`, plus any leftover
+    /// `*.tmp`) from [`cache_dir`](Self::cache_dir); other files in the
+    /// directory are left untouched. It is a no-op returning `Ok(())` when no
+    /// cache is configured or the directory does not exist yet. The next
+    /// request repopulates the cache as usual.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`Error::Io`] if the directory cannot be listed or an entry
+    /// cannot be removed.
+    pub fn clear_cache(&self) -> Result<()> {
+        match &self.cache {
+            Some(cache) => cache.clear(),
+            None => Ok(()),
+        }
     }
 
     // -- authors ---------------------------------------------------------
@@ -638,6 +663,31 @@ impl HttpCache {
         })
     }
 
+    /// Delete every `*.cache` / `*.tmp` file in the cache directory, leaving
+    /// any unrelated files (and a missing directory) alone.
+    fn clear(&self) -> Result<()> {
+        let entries = match std::fs::read_dir(&self.dir) {
+            Ok(entries) => entries,
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+            Err(e) => return Err(e.into()),
+        };
+        for entry in entries {
+            let path = entry?.path();
+            if !matches!(
+                path.extension().and_then(|ext| ext.to_str()),
+                Some("cache" | "tmp")
+            ) {
+                continue;
+            }
+            match std::fs::remove_file(&path) {
+                Ok(()) => {}
+                Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+                Err(e) => return Err(e.into()),
+            }
+        }
+        Ok(())
+    }
+
     /// Best-effort write of a response for `url`. Any I/O error is swallowed:
     /// the cache is an optimisation, never a source of failures.
     fn put(&self, url: &Url, status: u16, body: &[u8]) {
@@ -764,5 +814,45 @@ mod tests {
     #[test]
     fn no_cache_by_default() {
         assert!(Client::new().cache.is_none());
+        assert!(Client::new().cache_dir().is_none());
+    }
+
+    #[test]
+    fn clear_cache_removes_only_our_entries() {
+        let dir = std::env::temp_dir().join(format!(
+            "metacpan-api-modern-clear-{}-{}",
+            std::process::id(),
+            now_nanos()
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+
+        let client = Client::builder().cache_dir(&dir).build().unwrap();
+        assert_eq!(client.cache_dir(), Some(dir.as_path()));
+
+        let cache = client.cache.as_ref().unwrap();
+        let url = Url::parse("https://example.test/v1/author/PLICEASE").unwrap();
+        cache.put(&url, 200, b"{}");
+        assert!(cache.get(&url).is_some());
+
+        std::fs::write(dir.join("unrelated.txt"), b"keep me").unwrap();
+
+        client.clear_cache().unwrap();
+        assert!(cache.get(&url).is_none(), "cache entry was cleared");
+        assert!(
+            dir.join("unrelated.txt").exists(),
+            "unrelated files are left alone"
+        );
+
+        // Idempotent, and fine once the directory is gone entirely.
+        client.clear_cache().unwrap();
+        std::fs::remove_dir_all(&dir).unwrap();
+        client.clear_cache().unwrap();
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn clear_cache_is_noop_without_a_cache() {
+        Client::new().clear_cache().unwrap();
     }
 }

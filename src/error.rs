@@ -26,6 +26,11 @@ pub enum Error {
     #[error("metacpan api error: {0}")]
     Api(ApiError),
 
+    /// A filesystem error while reading from or clearing the on-disk response
+    /// cache (see [`ClientBuilder::cache_dir`](crate::ClientBuilder::cache_dir)).
+    #[error("cache i/o error: {0}")]
+    Io(#[from] std::io::Error),
+
     /// A response body could not be deserialized into the expected type.
     #[error("could not decode response from {path}: {source}")]
     Decode {
