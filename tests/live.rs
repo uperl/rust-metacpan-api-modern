@@ -150,7 +150,10 @@ async fn cache_dir_serves_get_from_disk() {
 
     // First client populates the cache from the network.
     let warm = Client::builder()
-        .user_agent(concat!("metacpan-api-modern-tests/", env!("CARGO_PKG_VERSION")))
+        .user_agent(concat!(
+            "metacpan-api-modern-tests/",
+            env!("CARGO_PKG_VERSION")
+        ))
         .cache_dir(&dir)
         .build()
         .unwrap();
@@ -164,7 +167,10 @@ async fn cache_dir_serves_get_from_disk() {
     // Second client shares the directory but has an unusably short timeout, so
     // any real request fails; a cached URL must still resolve.
     let offline = Client::builder()
-        .user_agent(concat!("metacpan-api-modern-tests/", env!("CARGO_PKG_VERSION")))
+        .user_agent(concat!(
+            "metacpan-api-modern-tests/",
+            env!("CARGO_PKG_VERSION")
+        ))
         .cache_dir(&dir)
         .timeout(Duration::from_millis(1))
         .build()

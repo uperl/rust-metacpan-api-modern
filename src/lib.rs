@@ -110,8 +110,8 @@ mod error;
 pub mod types;
 
 pub use client::{
-    Client, ClientBuilder, DEFAULT_BASE_URL, DEFAULT_CACHE_TTL, DEFAULT_USER_AGENT, DownloadUrlQuery,
-    PodFormat,
+    Client, ClientBuilder, DEFAULT_BASE_URL, DEFAULT_CACHE_TTL, DEFAULT_USER_AGENT,
+    DownloadUrlQuery, PodFormat,
 };
 pub use error::{ApiError, Error, Result};
 

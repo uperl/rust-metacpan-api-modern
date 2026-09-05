@@ -695,13 +695,14 @@ impl HttpCache {
             return;
         }
         let expires_at = now_secs().saturating_add(self.ttl.as_secs());
-        let mut contents =
-            format!("{expires_at}\n{status}\n{}\n\n", url.as_str()).into_bytes();
+        let mut contents = format!("{expires_at}\n{status}\n{}\n\n", url.as_str()).into_bytes();
         contents.extend_from_slice(body);
 
         // Write to a unique temp file then rename, so a concurrent reader never
         // observes a half-written entry.
-        let tmp = self.dir.join(format!("{}.{}.tmp", self.key(url), now_nanos()));
+        let tmp = self
+            .dir
+            .join(format!("{}.{}.tmp", self.key(url), now_nanos()));
         if std::fs::write(&tmp, contents).is_ok() {
             let _ = std::fs::rename(&tmp, self.entry_path(url));
         } else {
