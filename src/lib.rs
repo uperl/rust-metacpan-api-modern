@@ -82,6 +82,23 @@
 //! # }
 //! ```
 //!
+//! To avoid refetching the same data, point the client at a cache directory.
+//! Every `GET` is then served from disk until its entry is older than the
+//! time-to-live (one hour by default); `POST` searches are never cached:
+//!
+//! ```no_run
+//! # fn run() -> Result<(), metacpan_api_modern::Error> {
+//! use std::time::Duration;
+//!
+//! let mc = metacpan_api_modern::Client::builder()
+//!     .cache_dir("/tmp/metacpan-cache")
+//!     .cache_ttl(Duration::from_secs(24 * 60 * 60))
+//!     .build()?;
+//! # let _ = mc;
+//! # Ok(())
+//! # }
+//! ```
+//!
 //! [MetaCPAN]: https://metacpan.org/
 
 #![forbid(unsafe_code)]
@@ -93,7 +110,8 @@ mod error;
 pub mod types;
 
 pub use client::{
-    Client, ClientBuilder, DEFAULT_BASE_URL, DEFAULT_USER_AGENT, DownloadUrlQuery, PodFormat,
+    Client, ClientBuilder, DEFAULT_BASE_URL, DEFAULT_CACHE_TTL, DEFAULT_USER_AGENT,
+    DownloadUrlQuery, PodFormat,
 };
 pub use error::{ApiError, Error, Result};
 

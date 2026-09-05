@@ -120,6 +120,27 @@ configured base URL.
 the base URL, `User-Agent`, or timeout, or accepts a pre-built
 `reqwest::Client` (for proxies, custom TLS, and so on).
 
+### Caching
+
+`ClientBuilder::cache_dir` caches successful `GET` responses on the local
+filesystem. Each response is keyed by its full request URL and reused until it
+is older than `ClientBuilder::cache_ttl` (`DEFAULT_CACHE_TTL`, one hour, by
+default); `POST` searches are never cached.
+
+```rust
+use std::time::Duration;
+
+let mc = metacpan_api_modern::Client::builder()
+    .cache_dir("/tmp/metacpan-cache")
+    .cache_ttl(Duration::from_secs(24 * 60 * 60)) // optional; default is 1 hour
+    .build()?;
+```
+
+The directory is created on first write. Entries are ordinary files; deleting
+them (or the whole directory) just forces a refetch. `Client::clear_cache()`
+empties it programmatically (leaving any unrelated files in place), and
+`Client::cache_dir()` returns the configured path.
+
 ## Testing
 
 `cargo test` runs offline. The network integration tests are `#[ignore]`d:
