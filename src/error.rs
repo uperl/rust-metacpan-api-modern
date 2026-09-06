@@ -40,6 +40,12 @@ pub enum Error {
         #[source]
         source: serde_json::Error,
     },
+
+    /// A request body could not be serialized to JSON (only the `POST`
+    /// endpoints — [`Client::search`](crate::Client::search) and
+    /// [`Client::post_json`](crate::Client::post_json) — send one).
+    #[error("could not serialize request body: {0}")]
+    EncodeBody(#[source] serde_json::Error),
 }
 
 impl Error {

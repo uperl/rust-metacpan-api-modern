@@ -22,7 +22,7 @@ pub const DEFAULT_BASE_URL: &str = "https://fastapi.metacpan.org/v1/";
 pub const DEFAULT_USER_AGENT: &str =
     concat!(env!("CARGO_PKG_NAME"), "/", env!("CARGO_PKG_VERSION"));
 
-/// Default time-to-live for cached `GET` responses: one hour.
+/// Default time-to-live for cached responses: one hour.
 ///
 /// Used when [`ClientBuilder::cache_dir`] is set without an explicit
 /// [`ClientBuilder::cache_ttl`].
@@ -83,7 +83,7 @@ impl Client {
         &self.http
     }
 
-    /// The directory this client caches `GET` responses in, or `None` when
+    /// The directory this client caches responses in, or `None` when
     /// [`ClientBuilder::cache_dir`] was not set.
     pub fn cache_dir(&self) -> Option<&Path> {
         self.cache.as_ref().map(|cache| cache.dir.as_path())
@@ -396,15 +396,21 @@ impl Client {
     }
 
     /// Perform a `POST` of `body` as JSON to `path` and deserialize the JSON
-    /// response into `T`. `POST` requests are never cached.
+    /// response into `T`.
+    ///
+    /// Like `GET`, a successful (`2xx`) response is served from and stored in
+    /// the on-disk cache when [`ClientBuilder::cache_dir`] is set; the cache
+    /// key is the URL together with the request body, so different query
+    /// bodies to the same endpoint do not collide.
     pub async fn post_json<B, T>(&self, path: &str, body: &B) -> Result<T>
     where
         B: Serialize + ?Sized,
         T: DeserializeOwned,
     {
         let url = self.url(path)?;
-        let response = self.http.post(url).json(body).send().await?;
-        decode(path, response).await
+        let body = serde_json::to_vec(body).map_err(Error::EncodeBody)?;
+        let raw = self.post_raw(url, body).await?;
+        decode_bytes(path, raw.status, &raw.bytes)
     }
 
     /// Perform a `GET` for `path` with `query` params and return the response
@@ -432,8 +438,9 @@ impl Client {
     /// request is made and a successful (`2xx`) response is written to the
     /// cache before being returned.
     async fn get_raw(&self, url: Url) -> Result<RawResponse> {
+        let key = url.as_str();
         if let Some(cache) = &self.cache
-            && let Some(hit) = cache.get(&url)
+            && let Some(hit) = cache.get(key)
         {
             return Ok(hit);
         }
@@ -443,10 +450,47 @@ impl Client {
         if let Some(cache) = &self.cache
             && (200..300).contains(&status)
         {
-            cache.put(&url, status, &bytes);
+            cache.put(url.as_str(), status, &bytes);
         }
         Ok(RawResponse { status, bytes })
     }
+
+    /// Perform a `POST` of `body` (already-serialized JSON) to `url`, returning
+    /// the raw status and body bytes.
+    ///
+    /// Cached exactly like [`get_raw`](Self::get_raw), except the cache key is
+    /// the URL *and* the request body — so two `_search` queries to the same
+    /// endpoint are stored separately. Only `2xx` responses are cached.
+    async fn post_raw(&self, url: Url, body: Vec<u8>) -> Result<RawResponse> {
+        let key = post_cache_key(&url, &body);
+        if let Some(cache) = &self.cache
+            && let Some(hit) = cache.get(&key)
+        {
+            return Ok(hit);
+        }
+        let response = self
+            .http
+            .post(url)
+            .header("content-type", "application/json")
+            .body(body)
+            .send()
+            .await?;
+        let status = response.status().as_u16();
+        let bytes = response.bytes().await?.to_vec();
+        if let Some(cache) = &self.cache
+            && (200..300).contains(&status)
+        {
+            cache.put(&key, status, &bytes);
+        }
+        Ok(RawResponse { status, bytes })
+    }
+}
+
+/// Cache key for a `POST`: the URL and the request body, joined by a newline.
+/// The body is compact JSON (no newlines of its own), so the key stays a
+/// two-line string the cache-entry header can round-trip.
+fn post_cache_key(url: &Url, body: &[u8]) -> String {
+    format!("POST {url}\n{}", String::from_utf8_lossy(body))
 }
 
 /// A `GET` response reduced to the parts this crate needs, so it can come
@@ -470,12 +514,6 @@ fn api_error_from(status: u16, body: &str) -> Error {
             },
         }),
     }
-}
-
-async fn decode<T: DeserializeOwned>(path: &str, response: reqwest::Response) -> Result<T> {
-    let status = response.status().as_u16();
-    let bytes = response.bytes().await?;
-    decode_bytes(path, status, &bytes)
 }
 
 /// Shared by the cached and uncached paths: turn a status code and body bytes
@@ -587,8 +625,8 @@ impl ClientBuilder {
         self
     }
 
-    /// Cache successful `GET` responses on disk under `dir`, reusing them until
-    /// they are older than [`cache_ttl`](Self::cache_ttl) (one hour by default)
+    /// Cache successful responses on disk under `dir`, reusing them until they
+    /// are older than [`cache_ttl`](Self::cache_ttl) (one hour by default)
     /// before refetching.
     ///
     /// Every `GET` the client makes — the typed endpoint methods,
@@ -596,20 +634,21 @@ impl ClientBuilder {
     /// [`download_url`](Client::download_url), and
     /// [`search_lucene`](Client::search_lucene) — is keyed by its full request
     /// URL, including the query string. `POST` requests (the Elasticsearch
-    /// [`Client::search`]) are never cached, and only `2xx` responses are
-    /// stored; errors are always refetched.
+    /// [`Client::search`] and [`Client::post_json`]) are cached too, keyed by
+    /// the URL together with the request body so different query bodies do not
+    /// collide. Only `2xx` responses are stored; errors are always refetched.
     ///
     /// The directory is created on first write. Entries are ordinary files
-    /// named by a hash of the URL; deleting one, or the whole directory, simply
-    /// forces a refetch. Cache reads and writes are best-effort — an I/O error
-    /// falls back to a normal request rather than failing the call.
+    /// named by a hash of that key; deleting one, or the whole directory,
+    /// simply forces a refetch. Cache reads and writes are best-effort — an I/O
+    /// error falls back to a normal request rather than failing the call.
     pub fn cache_dir(mut self, dir: impl Into<PathBuf>) -> Self {
         self.cache_dir = Some(dir.into());
         self
     }
 
-    /// Override how long a cached `GET` response stays fresh. Has no effect
-    /// unless [`cache_dir`](Self::cache_dir) is also set. Defaults to
+    /// Override how long a cached response stays fresh. Has no effect unless
+    /// [`cache_dir`](Self::cache_dir) is also set. Defaults to
     /// [`DEFAULT_CACHE_TTL`] (one hour).
     pub fn cache_ttl(mut self, ttl: Duration) -> Self {
         self.cache_ttl = Some(ttl);
@@ -657,13 +696,14 @@ impl ClientBuilder {
     }
 }
 
-/// A filesystem cache of `GET` responses, configured by
+/// A filesystem cache of request responses, configured by
 /// [`ClientBuilder::cache_dir`].
 ///
-/// Each entry is one file, named `<hash-of-url>.cache`, laid out as a short
-/// UTF-8 header (`expires-at` unix seconds, then status, then the URL), a blank
-/// line, and the raw response body. The URL is stored so a hash collision reads
-/// as a miss rather than serving the wrong body.
+/// Each entry is one file, named `<hash-of-key>.cache`, laid out as a short
+/// UTF-8 header (`expires-at` unix seconds, then status, then the cache key),
+/// a blank line, and the raw response body. The key is stored so a hash
+/// collision reads as a miss rather than serving the wrong body. For a `GET`
+/// the key is the request URL; for a `POST` it is `POST <url>\n<body>`.
 #[derive(Debug, Clone)]
 struct HttpCache {
     dir: PathBuf,
@@ -671,31 +711,34 @@ struct HttpCache {
 }
 
 impl HttpCache {
-    /// Stable-per-URL basename (without extension) for a cache entry.
-    fn key(&self, url: &Url) -> String {
+    /// Stable-per-key basename (without extension) for a cache entry.
+    fn key(&self, cache_key: &str) -> String {
         use std::hash::{Hash, Hasher};
         let mut hasher = std::collections::hash_map::DefaultHasher::new();
-        url.as_str().hash(&mut hasher);
+        cache_key.hash(&mut hasher);
         format!("{:016x}", hasher.finish())
     }
 
-    fn entry_path(&self, url: &Url) -> PathBuf {
-        self.dir.join(format!("{}.cache", self.key(url)))
+    fn entry_path(&self, cache_key: &str) -> PathBuf {
+        self.dir.join(format!("{}.cache", self.key(cache_key)))
     }
 
-    /// Return a still-fresh cached response for `url`, if one exists. A missing
-    /// file, an unreadable or malformed entry, a URL mismatch (hash collision),
-    /// or an expired entry all read as a miss; expired entries are removed.
-    fn get(&self, url: &Url) -> Option<RawResponse> {
-        let path = self.entry_path(url);
+    /// Return a still-fresh cached response for `cache_key`, if one exists. A
+    /// missing file, an unreadable or malformed entry, a key mismatch (hash
+    /// collision), or an expired entry all read as a miss; expired entries are
+    /// removed.
+    fn get(&self, cache_key: &str) -> Option<RawResponse> {
+        let path = self.entry_path(cache_key);
         let raw = std::fs::read(&path).ok()?;
         let sep = raw.windows(2).position(|w| w == b"\n\n")?;
         let header = std::str::from_utf8(&raw[..sep]).ok()?;
-        let mut lines = header.lines();
+        // The key may itself contain newlines (a `POST` key does), so it is
+        // everything after the first two lines rather than a third line.
+        let mut lines = header.splitn(3, '\n');
         let expires_at: u64 = lines.next()?.parse().ok()?;
         let status: u16 = lines.next()?.parse().ok()?;
-        let cached_url = lines.next()?;
-        if cached_url != url.as_str() {
+        let cached_key = lines.next()?;
+        if cached_key != cache_key {
             return None;
         }
         if now_secs() >= expires_at {
@@ -733,23 +776,23 @@ impl HttpCache {
         Ok(())
     }
 
-    /// Best-effort write of a response for `url`. Any I/O error is swallowed:
-    /// the cache is an optimisation, never a source of failures.
-    fn put(&self, url: &Url, status: u16, body: &[u8]) {
+    /// Best-effort write of a response for `cache_key`. Any I/O error is
+    /// swallowed: the cache is an optimisation, never a source of failures.
+    fn put(&self, cache_key: &str, status: u16, body: &[u8]) {
         if std::fs::create_dir_all(&self.dir).is_err() {
             return;
         }
         let expires_at = now_secs().saturating_add(self.ttl.as_secs());
-        let mut contents = format!("{expires_at}\n{status}\n{}\n\n", url.as_str()).into_bytes();
+        let mut contents = format!("{expires_at}\n{status}\n{cache_key}\n\n").into_bytes();
         contents.extend_from_slice(body);
 
         // Write to a unique temp file then rename, so a concurrent reader never
         // observes a half-written entry.
         let tmp = self
             .dir
-            .join(format!("{}.{}.tmp", self.key(url), now_nanos()));
+            .join(format!("{}.{}.tmp", self.key(cache_key), now_nanos()));
         if std::fs::write(&tmp, contents).is_ok() {
-            let _ = std::fs::rename(&tmp, self.entry_path(url));
+            let _ = std::fs::rename(&tmp, self.entry_path(cache_key));
         } else {
             let _ = std::fs::remove_file(&tmp);
         }
@@ -822,24 +865,57 @@ mod tests {
             dir: dir.clone(),
             ttl: Duration::from_secs(3600),
         };
-        let url = Url::parse("https://example.test/v1/author/PLICEASE").unwrap();
+        let url = "https://example.test/v1/author/PLICEASE";
 
-        assert!(cache.get(&url).is_none(), "cold cache is a miss");
+        assert!(cache.get(url).is_none(), "cold cache is a miss");
 
-        cache.put(&url, 200, b"{\"name\":\"Graham\"}");
-        let hit = cache.get(&url).expect("warm cache is a hit");
+        cache.put(url, 200, b"{\"name\":\"Graham\"}");
+        let hit = cache.get(url).expect("warm cache is a hit");
         assert_eq!(hit.status, 200);
         assert_eq!(hit.bytes, b"{\"name\":\"Graham\"}");
 
-        let other = Url::parse("https://example.test/v1/author/OTHER").unwrap();
-        assert!(cache.get(&other).is_none(), "a different url is a miss");
+        assert!(
+            cache.get("https://example.test/v1/author/OTHER").is_none(),
+            "a different url is a miss"
+        );
 
         let stale = HttpCache {
             dir: dir.clone(),
             ttl: Duration::from_secs(0),
         };
-        stale.put(&url, 200, b"body");
-        assert!(cache.get(&url).is_none(), "an expired entry is a miss");
+        stale.put(url, 200, b"body");
+        assert!(cache.get(url).is_none(), "an expired entry is a miss");
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn http_cache_keys_post_by_url_and_body() {
+        let dir = std::env::temp_dir().join(format!(
+            "metacpan-api-modern-postcache-{}-{}",
+            std::process::id(),
+            now_nanos()
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        let cache = HttpCache {
+            dir: dir.clone(),
+            ttl: Duration::from_secs(3600),
+        };
+
+        let url = Url::parse("https://example.test/v1/release/_search").unwrap();
+        let key_a = post_cache_key(&url, br#"{"query":{"term":{"author":"PLICEASE"}}}"#);
+        let key_b = post_cache_key(&url, br#"{"query":{"term":{"author":"OTHER"}}}"#);
+
+        cache.put(&key_a, 200, b"a-body");
+        assert_eq!(cache.get(&key_a).unwrap().bytes, b"a-body");
+        assert!(
+            cache.get(&key_b).is_none(),
+            "a different request body is a miss"
+        );
+
+        cache.put(&key_b, 200, b"b-body");
+        assert_eq!(cache.get(&key_a).unwrap().bytes, b"a-body");
+        assert_eq!(cache.get(&key_b).unwrap().bytes, b"b-body");
 
         let _ = std::fs::remove_dir_all(&dir);
     }
@@ -876,14 +952,14 @@ mod tests {
         assert_eq!(client.cache_dir(), Some(dir.as_path()));
 
         let cache = client.cache.as_ref().unwrap();
-        let url = Url::parse("https://example.test/v1/author/PLICEASE").unwrap();
-        cache.put(&url, 200, b"{}");
-        assert!(cache.get(&url).is_some());
+        let url = "https://example.test/v1/author/PLICEASE";
+        cache.put(url, 200, b"{}");
+        assert!(cache.get(url).is_some());
 
         std::fs::write(dir.join("unrelated.txt"), b"keep me").unwrap();
 
         client.clear_cache().unwrap();
-        assert!(cache.get(&url).is_none(), "cache entry was cleared");
+        assert!(cache.get(url).is_none(), "cache entry was cleared");
         assert!(
             dir.join("unrelated.txt").exists(),
             "unrelated files are left alone"

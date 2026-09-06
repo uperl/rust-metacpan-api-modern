@@ -133,10 +133,12 @@ the base URL, `User-Agent`, or timeout, or accepts a pre-built
 
 ### Caching
 
-`ClientBuilder::cache_dir` caches successful `GET` responses on the local
-filesystem. Each response is keyed by its full request URL and reused until it
-is older than `ClientBuilder::cache_ttl` (`DEFAULT_CACHE_TTL`, one hour, by
-default); `POST` searches are never cached.
+`ClientBuilder::cache_dir` caches successful (`2xx`) responses on the local
+filesystem. A `GET` is keyed by its full request URL; a `POST` search
+(`Client::search`, `Client::post_json`) by the URL together with its request
+body, so different query bodies are cached separately. Each entry is reused
+until it is older than `ClientBuilder::cache_ttl` (`DEFAULT_CACHE_TTL`, one
+hour, by default).
 
 ```rust
 use std::time::Duration;
