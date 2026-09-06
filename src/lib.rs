@@ -87,8 +87,8 @@
 //! ```
 //!
 //! To avoid refetching the same data, point the client at a cache directory.
-//! Every `GET` is then served from disk until its entry is older than the
-//! time-to-live (one hour by default); `POST` searches are never cached:
+//! Every request — `GET`, and the `POST` searches too — is then served from
+//! disk until its entry is older than the time-to-live (one hour by default):
 //!
 //! ```no_run
 //! # fn run() -> Result<(), metacpan_api_modern::Error> {
