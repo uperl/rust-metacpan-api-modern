@@ -1,6 +1,6 @@
 [package]
 name = "metacpan-api-modern"
-version = "0.2.1"
+version = "0.3.0"
 edition = "2024"
 description = "Modern interface to the Metacpan API"
 repository = "https://github.com/uperl/metacpan-api-modern"
