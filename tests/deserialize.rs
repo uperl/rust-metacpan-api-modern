@@ -2,8 +2,8 @@
 //! `api.metacpan.org` responses, including the awkward cases) through the
 //! crate's `serde` types.
 
-use metacpan_api_modern::types::{MirrorList, ReleaseEnvelope};
-use metacpan_api_modern::{Author, DownloadUrl, Release, SearchResponse};
+use metacpan_api_modern::types::{MirrorList, PermissionList, ReleaseEnvelope};
+use metacpan_api_modern::{Author, DownloadUrl, Permission, Release, SearchResponse};
 
 #[test]
 fn author_with_scalar_email_and_nested_extra() {
@@ -138,6 +138,38 @@ fn mirror_list() {
     assert_eq!(mirrors.len(), 1);
     assert_eq!(mirrors[0].http.as_deref(), Some("http://www.cpan.org/"));
     assert_eq!(mirrors[0].location, vec![0.0, 0.0]);
+}
+
+#[test]
+fn permission_single_and_enveloped_list() {
+    let single = r#"{
+        "module_name": "Moose",
+        "owner": "STEVAN",
+        "co_maintainers": ["DOY", "DROLSKY", "ETHER"]
+    }"#;
+    let perm: Permission = serde_json::from_str(single).unwrap();
+    assert_eq!(perm.module_name.as_deref(), Some("Moose"));
+    assert_eq!(perm.owner.as_deref(), Some("STEVAN"));
+    assert_eq!(perm.co_maintainers, vec!["DOY", "DROLSKY", "ETHER"]);
+
+    // by_author / by_module wrap the rows in a `permissions` array, and an
+    // owner-less namespace with no co-maintainers is still well formed.
+    let list_json = r#"{ "permissions": [
+        { "module_name": "Acme::Color::Rust", "owner": "PLICEASE", "co_maintainers": [] },
+        { "module_name": "Orphaned::Thing", "co_maintainers": "SOLEHEIR" }
+    ] }"#;
+    let list: PermissionList = serde_json::from_str(list_json).unwrap();
+    assert_eq!(list.permissions.len(), 2);
+    assert!(list.permissions[0].co_maintainers.is_empty());
+    assert!(list.permissions[1].owner.is_none());
+    // `co_maintainers` sent as a bare string is normalised to a one-element list.
+    assert_eq!(list.permissions[1].co_maintainers, vec!["SOLEHEIR"]);
+}
+
+#[test]
+fn permission_list_defaults_to_empty() {
+    let list: PermissionList = serde_json::from_str("{}").unwrap();
+    assert!(list.permissions.is_empty());
 }
 
 #[test]

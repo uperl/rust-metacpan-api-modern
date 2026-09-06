@@ -113,6 +113,55 @@ async fn mirrors_list() {
 
 #[tokio::test]
 #[ignore = "network"]
+async fn permissions() {
+    let mc = client();
+
+    let moose = mc.permission("Moose").await.unwrap();
+    assert_eq!(moose.module_name.as_deref(), Some("Moose"));
+    assert_eq!(moose.owner.as_deref(), Some("STEVAN"));
+    assert!(moose.co_maintainers.contains(&"ETHER".to_string()));
+
+    let err = mc
+        .permission("Not::A::Real::Module::Xyzzy")
+        .await
+        .unwrap_err();
+    assert!(err.is_not_found(), "expected 404, got {err:?}");
+
+    let by_author = mc.permissions_by_author("PLICEASE").await.unwrap();
+    assert!(
+        by_author
+            .iter()
+            .any(|p| p.module_name.as_deref() == Some("FFI::Platypus"))
+    );
+    assert!(
+        mc.permissions_by_author("NOSUCHAUTHORXYZZY")
+            .await
+            .unwrap()
+            .is_empty()
+    );
+
+    let by_module = mc
+        .permissions_by_module(["Moose", "FFI::Platypus", "No::Such::Mod::Xyzzy"])
+        .await
+        .unwrap();
+    let names: Vec<_> = by_module
+        .iter()
+        .filter_map(|p| p.module_name.as_deref())
+        .collect();
+    assert!(names.contains(&"Moose"));
+    assert!(names.contains(&"FFI::Platypus"));
+    assert!(!names.contains(&"No::Such::Mod::Xyzzy"));
+
+    // The API rejects a lookup with no module at all.
+    assert!(
+        mc.permissions_by_module(Vec::<String>::new())
+            .await
+            .is_err()
+    );
+}
+
+#[tokio::test]
+#[ignore = "network"]
 async fn search_dsl_typed() {
     let resp: SearchResponse<Release> = client()
         .search(

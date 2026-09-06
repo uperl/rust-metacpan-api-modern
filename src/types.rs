@@ -473,6 +473,50 @@ pub struct River {
 }
 
 // ---------------------------------------------------------------------------
+// permission
+// ---------------------------------------------------------------------------
+
+/// PAUSE upload permissions for a module namespace, as returned by
+/// `GET /permission/{module}` and inside the lists from
+/// `GET /permission/by_author/{author}` and `GET /permission/by_module`.
+///
+/// This mirrors a row of PAUSE's `06perms` database: an indexed namespace has
+/// at most one primary owner (the `m` permission, granted first-come) plus any
+/// number of co-maintainers (`c`) the owner has since added.
+#[derive(Debug, Clone, Deserialize)]
+#[non_exhaustive]
+pub struct Permission {
+    /// The module namespace the permissions apply to, e.g. `Moose`.
+    pub module_name: Option<String>,
+    /// PAUSE id of the primary owner, when the namespace has one. A namespace
+    /// with only co-maintainers and no current owner is possible.
+    pub owner: Option<String>,
+    /// PAUSE ids granted co-maintainer upload rights. Returned sorted by the
+    /// API; empty when there are none.
+    #[serde(default, deserialize_with = "one_or_many")]
+    pub co_maintainers: Vec<String>,
+    /// Any other fields present in the response.
+    #[serde(flatten)]
+    pub other: Extra,
+}
+
+/// Envelope returned by `GET /permission/by_author/{author}` and
+/// `GET /permission/by_module`. [`Client::permissions_by_author`] and
+/// [`Client::permissions_by_module`] unwrap it for you; it is public only so
+/// the shape can be named in tests.
+///
+/// [`Client::permissions_by_author`]: crate::Client::permissions_by_author
+/// [`Client::permissions_by_module`]: crate::Client::permissions_by_module
+#[doc(hidden)]
+#[derive(Debug, Clone, Deserialize)]
+#[non_exhaustive]
+pub struct PermissionList {
+    /// The permission entries.
+    #[serde(default)]
+    pub permissions: Vec<Permission>,
+}
+
+// ---------------------------------------------------------------------------
 // download_url
 // ---------------------------------------------------------------------------
 
