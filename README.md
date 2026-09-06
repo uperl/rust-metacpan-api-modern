@@ -58,6 +58,14 @@ async fn main() -> Result<(), metacpan_api_modern::Error> {
     let mirrors = mc.mirrors().await?;
     println!("{} mirrors", mirrors.len());
 
+    // PAUSE upload permissions (PAUSE `06perms`).
+    let perm = mc.permission("FFI::Platypus").await?;
+    println!("owner {:?}", perm.owner);
+    let mine = mc.permissions_by_author("PLICEASE").await?;
+    println!("{} namespaces", mine.len());
+    let some = mc.permissions_by_module(["Moose", "FFI::Platypus"]).await?;
+    println!("{} looked up", some.len());
+
     Ok(())
 }
 ```
@@ -108,6 +116,9 @@ for release in recent.sources() {
 | `changes` / `changes_for_release` | `GET /changes/...` |
 | `download_url` / `download_url_with` | `GET /download_url/{module}` |
 | `mirrors` | `GET /mirror` |
+| `permission` | `GET /permission/{module}` |
+| `permissions_by_author` | `GET /permission/by_author/{author}` |
+| `permissions_by_module` | `GET /permission/by_module?module=...` |
 | `search` / `search_lucene` | `POST` / `GET /{type}/_search` |
 
 For anything else, `Client::get_json`, `Client::post_json`, and

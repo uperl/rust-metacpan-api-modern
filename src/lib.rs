@@ -30,6 +30,10 @@
 //! // Rendered documentation.
 //! let pod = mc.pod("FFI::Platypus", PodFormat::Plain).await?;
 //! println!("{}", &pod[..pod.len().min(200)]);
+//!
+//! // PAUSE upload permissions for a module.
+//! let perm = mc.permission("FFI::Platypus").await?;
+//! println!("owner {:?}, co-maint {:?}", perm.owner, perm.co_maintainers);
 //! # Ok(())
 //! # }
 //! ```
@@ -118,7 +122,8 @@ pub use error::{ApiError, Error, Result};
 #[doc(inline)]
 pub use types::{
     Author, Changes, Dependency, Distribution, DownloadUrl, File, Hit, Hits, Mirror, ModuleInfo,
-    Profile, Release, ReleaseCount, Resources, River, SearchResponse, Stat, TestSummary, Total,
+    Permission, Profile, Release, ReleaseCount, Resources, River, SearchResponse, Stat,
+    TestSummary, Total,
 };
 
 // Re-export `reqwest` so downstream crates can name its types (for

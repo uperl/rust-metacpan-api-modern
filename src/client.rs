@@ -8,8 +8,8 @@ use url::Url;
 
 use crate::error::{ApiError, Error, Result};
 use crate::types::{
-    Author, Changes, Distribution, DownloadUrl, File, Mirror, MirrorList, Release, ReleaseEnvelope,
-    SearchResponse,
+    Author, Changes, Distribution, DownloadUrl, File, Mirror, MirrorList, Permission,
+    PermissionList, Release, ReleaseEnvelope, SearchResponse,
 };
 
 /// Base URL of the public production MetaCPAN API.
@@ -266,6 +266,51 @@ impl Client {
     pub async fn mirrors(&self) -> Result<Vec<Mirror>> {
         let list: MirrorList = self.get_json("mirror").await?;
         Ok(list.mirrors)
+    }
+
+    // -- permissions ---------------------------------------------------
+
+    /// Fetch the PAUSE upload permissions for a single module namespace.
+    ///
+    /// `GET /permission/{module}`
+    pub async fn permission(&self, module: &str) -> Result<Permission> {
+        self.get_json(&format!("permission/{module}")).await
+    }
+
+    /// List every module namespace for which `author` is the owner or a
+    /// co-maintainer. Returns an empty `Vec` for an unknown PAUSE id.
+    ///
+    /// `GET /permission/by_author/{author}`
+    pub async fn permissions_by_author(&self, author: &str) -> Result<Vec<Permission>> {
+        let list: PermissionList = self
+            .get_json(&format!("permission/by_author/{author}"))
+            .await?;
+        Ok(list.permissions)
+    }
+
+    /// Fetch permissions for several module namespaces in one request. A
+    /// namespace with no `06perms` entry is simply absent from the result, and
+    /// the order is chosen by the server (currently alphabetical by module
+    /// name). At least one module must be supplied; an empty iterator makes the
+    /// API respond `400`.
+    ///
+    /// `GET /permission/by_module?module=...&module=...`
+    pub async fn permissions_by_module<I, S>(&self, modules: I) -> Result<Vec<Permission>>
+    where
+        I: IntoIterator<Item = S>,
+        S: AsRef<str>,
+    {
+        let path = "permission/by_module";
+        let mut url = self.url(path)?;
+        {
+            let mut pairs = url.query_pairs_mut();
+            for module in modules {
+                pairs.append_pair("module", module.as_ref());
+            }
+        }
+        let raw = self.get_raw(url).await?;
+        let list: PermissionList = decode_bytes(path, raw.status, &raw.bytes)?;
+        Ok(list.permissions)
     }
 
     // -- search --------------------------------------------------------
